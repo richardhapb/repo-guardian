@@ -83,5 +83,5 @@ async fn rocket() -> _ {
     rocket::build()
         .manage(app)
         .manage(WebhookSecret::new(secret))
-        .mount("/", routes![webhook::webhook_gh])
+        .mount("/", routes![webhook::webhook_gh, webhook::health])
 }

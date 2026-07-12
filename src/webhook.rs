@@ -92,6 +92,12 @@ impl<'r, T: DeserializeOwned> FromData<'r> for GhWebhook<T> {
     }
 }
 
+/// Liveness probe for reverse proxies / monitoring.
+#[get("/health")]
+pub fn health() -> &'static str {
+    "ok"
+}
+
 /// Reviews run for minutes; GitHub times webhook deliveries out at 10s, so
 /// the pipeline is spawned and the delivery acknowledged immediately.
 #[post("/webhook/gh", data = "<payload>")]
@@ -158,8 +164,18 @@ mod tests {
         let rocket = rocket::build()
             .manage(guardian)
             .manage(WebhookSecret::new(SECRET))
-            .mount("/", routes![webhook_gh]);
+            .mount("/", routes![webhook_gh, health]);
         Client::tracked(rocket).await.unwrap()
+    }
+
+    #[rocket::async_test]
+    async fn health_responds_ok_without_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = client(&dir).await;
+
+        let response = client.get("/health").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(response.into_string().await.as_deref(), Some("ok"));
     }
 
     #[rocket::async_test]
