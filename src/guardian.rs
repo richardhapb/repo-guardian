@@ -8,13 +8,12 @@ use std::{
 };
 
 use claude_code::{ClaudeConfig, ClaudeError, CommandRunner, DefaultRunner};
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::state::PostedComment;
 
 /// Severity taxonomy borrowed from the mr-review flow.
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// Wrong behavior, regressions, broken invariants. Blocks approval.
@@ -46,7 +45,7 @@ impl Display for Severity {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LineRange {
     pub start: usize,
     pub end: usize,
@@ -62,7 +61,7 @@ impl Display for LineRange {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Comment {
     pub severity: Severity,
     pub text: String,
@@ -72,7 +71,7 @@ pub struct Comment {
     pub lines: LineRange,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ReviewResult {
     pub approved: bool,
     pub comments: Vec<Comment>,
@@ -225,13 +224,52 @@ fn extract_json(stdout: &str) -> &str {
     }
 }
 
-/// The claude CLI validates `--json-schema` with Ajv, which doesn't know
-/// draft 2020-12 (schemars' default), so the schema is generated as draft-07.
+/// Hand-written schema for [`ReviewResult`], restricted to the subset the
+/// CLI's structured-output path supports: `type`, `properties`, `required`,
+/// `items`, `enum`, `minimum`, `description`. schemars' draft-07 output
+/// (`$schema`, `definitions`/`$ref`, `oneOf`+`const`, `format`) makes the
+/// CLI silently omit `structured_output` while still exiting 0.
 fn review_schema() -> String {
-    let schema = schemars::generate::SchemaSettings::draft07()
-        .into_generator()
-        .into_root_schema_for::<ReviewResult>();
-    serde_json::to_string(&schema).expect("serialize ReviewResult schema")
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "approved": {
+                "type": "boolean",
+                "description": "True only when there are no bug-severity findings."
+            },
+            "comments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "severity": {"type": "string", "enum": ["bug", "design", "nit"]},
+                        "text": {"type": "string"},
+                        "file": {
+                            "type": "string",
+                            "description": "Path relative to the repo root."
+                        },
+                        "lines": {
+                            "type": "object",
+                            "description": "Line range in the new version of the file.",
+                            "properties": {
+                                "start": {"type": "integer", "minimum": 0},
+                                "end": {"type": "integer", "minimum": 0}
+                            },
+                            "required": ["start", "end"]
+                        }
+                    },
+                    "required": ["severity", "text", "file", "lines"]
+                }
+            },
+            "resolved_previous": {
+                "type": "array",
+                "description": "Indices of the previously-open comments that the latest push resolved.",
+                "items": {"type": "integer", "minimum": 0}
+            }
+        },
+        "required": ["approved", "comments"]
+    })
+    .to_string()
 }
 
 fn build_prompt(commits: &[String], repo_location: &str, previous: &[PostedComment]) -> String {
@@ -415,15 +453,45 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_draft07_for_the_claude_cli() {
-        let schema: serde_json::Value = serde_json::from_str(&review_schema()).unwrap();
-        assert_eq!(
-            schema["$schema"],
-            "http://json-schema.org/draft-07/schema#"
-        );
+    fn schema_avoids_constructs_the_cli_silently_rejects() {
+        // $schema, definitions/$ref, oneOf/allOf+const and format make the
+        // CLI omit structured_output while still exiting 0
+        let raw = review_schema();
+        for keyword in ["$schema", "definitions", "$ref", "oneOf", "allOf", "format"] {
+            assert!(!raw.contains(keyword), "schema contains {keyword}");
+        }
+        let schema: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let props = schema.get("properties").expect("schema has properties");
         for field in ["approved", "comments", "resolved_previous"] {
             assert!(props.get(field).is_some(), "missing {field}");
+        }
+    }
+
+    #[test]
+    fn schema_conforming_value_deserializes_into_review_result() {
+        // keeps the hand-written schema in sync with the types
+        let sample = serde_json::json!({
+            "approved": false,
+            "comments": [{
+                "severity": "design",
+                "text": "t",
+                "file": "src/a.rs",
+                "lines": {"start": 1, "end": 2}
+            }],
+            "resolved_previous": [0, 3]
+        });
+        let result: ReviewResult = serde_json::from_value(sample).unwrap();
+        assert_eq!(result.comments[0].severity, Severity::Design);
+        assert_eq!(result.resolved_previous, vec![0, 3]);
+
+        // every severity the schema's enum lists round-trips
+        let schema: serde_json::Value = serde_json::from_str(&review_schema()).unwrap();
+        let severities = schema["properties"]["comments"]["items"]["properties"]["severity"]
+            ["enum"]
+            .as_array()
+            .expect("severity enum");
+        for s in severities {
+            assert!(serde_json::from_value::<Severity>(s.clone()).is_ok(), "{s}");
         }
     }
 

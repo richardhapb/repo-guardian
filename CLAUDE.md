@@ -62,10 +62,12 @@ comment), optionally auto-merging.
 
 ## Gotchas / insights
 
-- The claude CLI validates `--json-schema` with Ajv, which does NOT support
-  draft 2020-12 (schemars 1.x default). `review_schema()` generates
-  **draft-07** via `SchemaSettings::draft07()`. Don't switch back to
-  `claude_code::generate_schema` — it emits 2020-12 and the CLI exits 1.
+- The claude CLI's structured output only supports a schema subset (`type`,
+  `properties`, `required`, `items`, `enum`, `minimum`, `description`).
+  Anything schemars emits (`$schema`, `definitions`/`$ref`, `oneOf`+`const`,
+  `format`) makes the CLI **silently omit `structured_output`** — exit 0,
+  prose in `result`, nothing to parse. `review_schema()` is hand-written for
+  that subset; don't switch to schema generation without probing the CLI.
 - Since claude CLI 2.x the schema-conforming value arrives in a separate
   `structured_output` response field (`result` holds prose). claude-code
   0.1.2's `ClaudeResponse`/`parse_result` only know `result`, so
