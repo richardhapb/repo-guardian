@@ -12,9 +12,8 @@ comment), optionally auto-merging.
    pipeline runs in a spawned task (GitHub times deliveries out at 10s).
 2. `state::StateStore::begin_review` atomically claims the (PR, head sha);
    duplicates/redeliveries are skipped.
-3. `repos::resolve` clones/fetches `<repos_path>/<owner>/<name>` — unless a
-   hand-made checkout exists at `<repos_path>/<name>` whose origin is the same
-   repo, which is reused instead; the PR head
+3. `repos::resolve` clones/fetches `<repos_path>/<name>` (no owner prefix,
+   so hand-made clones are picked up as-is); the PR head
    (`refs/pull/N/head`) is fetched and materialized as a detached worktree
    (`<name>-pr-N`) so the reviewer reads the PR's version of files.
 4. `guardian::Guardian::review` runs `claude --print` (via the `claude-code`
