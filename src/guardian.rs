@@ -116,6 +116,10 @@ impl<R: CommandRunner + Clone> Guardian<R> {
         let config = ClaudeConfig::builder()
             .json_schema(self.schema.clone())
             .add_dir(repo_location)
+            // The Normal preset passes `--tools ""` unless overridden,
+            // leaving the reviewer with no tools at all: it must be able to
+            // run git and read files. allowed_tools then auto-approves them.
+            .tools("Read,Grep,Glob,Bash")
             .allowed_tools(["Read", "Grep", "Glob", "Bash(git:*)"])
             .max_turns(64)
             .timeout(Duration::from_secs(900))
@@ -399,6 +403,9 @@ mod tests {
         assert!(args.contains("abc123"));
         assert!(args.contains("off-by-one in pagination"));
         assert!(args.contains("resolved_previous"));
+        // the preset's `--tools ""` must be overridden or the reviewer
+        // has no tools at all
+        assert!(args.contains("--tools\nRead,Grep,Glob,Bash"));
     }
 
     #[test]
