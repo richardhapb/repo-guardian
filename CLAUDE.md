@@ -66,6 +66,11 @@ comment), optionally auto-merging.
   draft 2020-12 (schemars 1.x default). `review_schema()` generates
   **draft-07** via `SchemaSettings::draft07()`. Don't switch back to
   `claude_code::generate_schema` — it emits 2020-12 and the CLI exits 1.
+- Since claude CLI 2.x the schema-conforming value arrives in a separate
+  `structured_output` response field (`result` holds prose). claude-code
+  0.1.2's `ClaudeResponse`/`parse_result` only know `result`, so
+  `Guardian::review` runs the CLI via `CommandRunner` + `config.to_args`
+  and parses the raw response itself, falling back to `result` for old CLIs.
 - `Octocrab::builder().build()` and any octocrab call need a tokio reactor:
   the `#[launch]` fn must be `async`, and the builder is `!Send` so it must be
   scoped in a block (not held across an `.await`). Same reason webhook tests
