@@ -5,18 +5,18 @@ use std::sync::Arc;
 
 use crate::{
     App,
-    github::{ReviewSubmission, ReviewVerdict, comment_body, payload::PullRequestWH},
+    github::{ReviewSubmission, ReviewVerdict, payload::PullRequestWH},
     guardian::{Comment, ReviewResult, Severity},
     repos,
-    state::{BeginReview, PostedComment},
+    state::BeginReview,
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub async fn process(app: Arc<App>, event: PullRequestWH) {
-    let (repository, pull_request, number) = match event {
-        PullRequestWH::Opened(e) => (e.repository, e.pull_request, e.number),
-        PullRequestWH::Synchronize(e) => (e.repository, e.pull_request, e.number),
+    let (repository, pull_request, number, synchronize) = match event {
+        PullRequestWH::Opened(e) => (e.repository, e.pull_request, e.number, false),
+        PullRequestWH::Synchronize(e) => (e.repository, e.pull_request, e.number, true),
         PullRequestWH::Unsupported => return,
     };
 
@@ -34,7 +34,7 @@ pub async fn process(app: Arc<App>, event: PullRequestWH) {
     tracing::info!(%key, sha = %head_sha, "review started");
     let started = std::time::Instant::now();
     let author = pull_request.user.login.as_deref();
-    match review_round(&app, &repository, author, number, &key, &head_sha).await {
+    match review_round(&app, &repository, author, number, &key, &head_sha, synchronize).await {
         Ok(()) => tracing::info!(
             %key,
             sha = %head_sha,
@@ -54,6 +54,7 @@ pub async fn process(app: Arc<App>, event: PullRequestWH) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn review_round(
     app: &App,
     repository: &crate::github::payload::Repository,
@@ -61,6 +62,7 @@ async fn review_round(
     number: i32,
     key: &str,
     head_sha: &str,
+    synchronize: bool,
 ) -> Result<(), Error> {
     let (owner, name) = repository
         .owner_and_name()
@@ -72,7 +74,14 @@ async fn review_round(
     let worktree = repos::pr_worktree(&checkout, number).await?;
 
     let commits = app.gh.pr_commits(owner, name, pr).await?;
-    let previous = app.store.open_comments(key).await;
+    // GitHub's unresolved review threads are the source of truth for what
+    // Guardian flagged earlier; local state doesn't track comments. A just
+    // opened PR can't have Guardian threads yet, so only pushes fetch them.
+    let previous = if synchronize {
+        app.gh.open_guardian_comments(owner, name, pr).await?
+    } else {
+        vec![]
+    };
 
     let result = app
         .guardian
@@ -86,17 +95,15 @@ async fn review_round(
 
     // Guardian said which earlier comments the new code fixes; resolve their
     // threads on GitHub.
-    let resolved_ids: Vec<u64> = result
+    let fixed_threads: Vec<String> = result
         .resolved_previous
         .iter()
         .filter_map(|&i| previous.get(i))
-        .filter_map(|p| p.comment_id)
+        .map(|p| p.thread_id.clone())
         .collect();
-    if !resolved_ids.is_empty() {
-        let resolved = app
-            .gh
-            .resolve_comment_threads(owner, name, pr, &resolved_ids)
-            .await?;
+    let mut resolved = 0;
+    if !fixed_threads.is_empty() {
+        resolved = app.gh.resolve_threads(&fixed_threads).await?;
         tracing::info!(%key, resolved, "resolved fixed comment threads");
     }
 
@@ -117,7 +124,7 @@ async fn review_round(
             ReviewSubmission {
                 commit_id: head_sha,
                 verdict: choose_verdict(approved, own_pr),
-                body: &review_body(approved, own_pr, &result.comments, resolved_ids.len()),
+                body: &review_body(approved, own_pr, &result.comments, resolved),
                 comments: &result.comments,
             },
         )
@@ -131,29 +138,7 @@ async fn review_round(
         "review posted"
     );
 
-    // Learn the database ids GitHub assigned to the comments we just posted
-    // so the next round can resolve their threads.
-    let posted = app.gh.review_comments(owner, name, pr, review_id).await?;
-    let tracked: Vec<PostedComment> = result
-        .comments
-        .iter()
-        .map(|c| PostedComment {
-            comment_id: posted
-                .iter()
-                .find(|rc| rc.path == c.file && rc.body == comment_body(c))
-                .map(|rc| *rc.id),
-            comment: c.clone(),
-        })
-        .collect();
-
-    let still_open: Vec<PostedComment> = previous
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !result.resolved_previous.contains(i))
-        .map(|(_, p)| p)
-        .chain(tracked)
-        .collect();
-    app.store.finish_review(key, still_open).await;
+    app.store.finish_review(key).await;
 
     if approved && app.config.auto_merge {
         // A failed merge (branch protection, conflicts) shouldn't mark the
@@ -171,11 +156,7 @@ async fn review_round(
 /// too so an inconsistent result can never approve (or auto-merge) a PR
 /// with an open bug.
 fn decide_approval(result: &ReviewResult) -> bool {
-    result.approved
-        && result
-            .comments
-            .iter()
-            .all(|c| c.severity != Severity::Bug)
+    result.approved && result.comments.iter().all(|c| c.severity != Severity::Bug)
 }
 
 fn choose_verdict(approved: bool, own_pr: bool) -> ReviewVerdict {
@@ -199,7 +180,7 @@ fn review_body(approved: bool, own_pr: bool, comments: &[Comment], resolved: usi
     let mut body = format!("## \u{1f6e1}\u{fe0f} Guardian review\n\n**Verdict: {verdict}**\n");
 
     if comments.is_empty() {
-        body.push_str("\n\u{2728} No findings.\n");
+        body.push_str("\n\u{1f389} No findings.\n");
     } else {
         body.push_str("\n| Severity | Count |\n| --- | --- |\n");
         for severity in [Severity::Bug, Severity::Design, Severity::Nit] {
@@ -263,7 +244,7 @@ mod tests {
         let body = review_body(true, false, &[], 0);
         assert!(body.contains("## \u{1f6e1}\u{fe0f} Guardian review"));
         assert!(body.contains("**Verdict: \u{2705} Approved**"));
-        assert!(body.contains("\u{2728} No findings."));
+        assert!(body.contains("\u{1f389} No findings."));
         assert!(!body.contains("Resolved"));
 
         let body = review_body(true, true, &[], 2);
@@ -281,14 +262,6 @@ mod tests {
         assert!(body.contains("| \u{1f7e1} **Design** | 1 |"));
         // zero-count severities are omitted from the table
         assert!(!body.contains("**Nit**"));
-    }
-
-    #[test]
-    fn comment_body_leads_with_the_severity_badge() {
-        assert_eq!(
-            comment_body(&comment(Severity::Bug)),
-            "\u{1f534} **Bug**\n\nfinding"
-        );
     }
 
     #[test]

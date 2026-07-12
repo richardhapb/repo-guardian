@@ -16,11 +16,13 @@ comment), optionally auto-merging.
    so hand-made clones are picked up as-is); the PR head
    (`refs/pull/N/head`) is fetched and materialized as a detached worktree
    (`<name>-pr-N`) so the reviewer reads the PR's version of files.
-4. `guardian::Guardian::review` runs `claude --print` (via the `claude-code`
+4. On `synchronize`, the PR's unresolved `[Repo Guardian]` review threads are
+   fetched from GitHub (GraphQL) and replayed in the prompt as the
+   previously-open comments.
+5. `guardian::Guardian::review` runs `claude --print` (via the `claude-code`
    crate) with a JSON schema; returns `{approved, comments[], resolved_previous[]}`.
-5. Pipeline resolves fixed comment threads (GraphQL), posts one review with all
-   inline comments, records the posted comment ids in state, merges if
-   `approved && auto_merge`.
+6. Pipeline resolves fixed comment threads (GraphQL, by thread id), posts one
+   review with all inline comments, merges if `approved && auto_merge`.
 
 ## Module map
 
@@ -42,7 +44,8 @@ comment), optionally auto-merging.
 - **Severities** (mr-review taxonomy): `bug` blocks approval, `design` pushes
   back without blocking, `nit` is optional polish. The pipeline vetoes
   `approved` if any bug-severity comment exists (defense against inconsistent
-  model output). Comment bodies: `🔴 **Bug**` / `🟡 **Design**` / `🟢 **Nit**`.
+  model output). Comment bodies: `[Repo Guardian] 🔴 **Bug**` / `🟡 **Design**`
+  / `🟢 **Nit**` — the marker is how the next round recognizes its own threads.
 - **Self-PR handling**: GitHub rejects APPROVE and REQUEST_CHANGES on your own
   PR. The authenticated login is fetched at boot (`octocrab.current().user()`,
   no config field); matching PRs get a neutral COMMENT review whose body
@@ -52,10 +55,13 @@ comment), optionally auto-merging.
 - **Loop safeguards**: `max_attempts_per_sha` (default 3) caps failure retries,
   `max_reviews_per_pr` (default 20) caps lifetime reviews. Structurally our own
   actions can't re-trigger us (reviews/merges emit event types we ignore).
-- **Auto-resolution**: open comments are replayed in the next round's prompt;
-  the model returns indices of fixed ones; threads are resolved via the
-  GraphQL `resolveReviewThread` mutation (REST cannot resolve threads — that's
-  why posted comment database ids are tracked in state).
+- **Auto-resolution**: GitHub is the source of truth for open comments —
+  each `synchronize` round fetches the PR's unresolved review threads whose
+  first comment starts with the `[Repo Guardian]` marker (or a bare severity
+  badge, for pre-marker comments) and replays them in the prompt; the model
+  returns indices of fixed ones; their threads are resolved via the GraphQL
+  `resolveReviewThread` mutation (REST cannot resolve threads). State does
+  NOT track comments; it only handles idempotency and caps.
 - **Secrets live in env** (`GITHUB_WEBHOOK_SECRET` required, `GITHUB_TOKEN`
   for API/private repos), never in config.toml (gitignored).
 - Em-dashes and emojis are fine in GitHub-facing review text.
@@ -77,6 +83,11 @@ comment), optionally auto-merging.
   the `#[launch]` fn must be `async`, and the builder is `!Send` so it must be
   scoped in a block (not held across an `.await`). Same reason webhook tests
   use `rocket::local::asynchronous` + `#[rocket::async_test]`.
+- `octocrab.graphql()` returns `Ok` on HTTP 200 even when the payload carries
+  an `errors` array — every GraphQL call must go through
+  `check_graphql_errors` or a denied mutation silently counts as success
+  (this is why heramty#50's review body claimed a resolution that never
+  happened on GitHub).
 - `octocrab.pulls().reviews().create_review()` takes the *response* model
   `ReviewComment` (unbuildable); reviews are posted via `crab.post` with raw
   JSON, which also enables `line`/`start_line` multi-line anchors.

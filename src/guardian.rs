@@ -10,7 +10,7 @@ use std::{
 use claude_code::{ClaudeConfig, ClaudeError, CommandRunner, DefaultRunner};
 use serde::{Deserialize, Serialize};
 
-use crate::state::PostedComment;
+use crate::github::OpenComment;
 
 /// Severity taxonomy borrowed from the mr-review flow.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,7 +110,7 @@ impl<R: CommandRunner + Clone> Guardian<R> {
         &self,
         commits: &[String],
         repo_location: &str,
-        previous: &[PostedComment],
+        previous: &[OpenComment],
     ) -> Result<ReviewResult, ClaudeError> {
         let config = ClaudeConfig::builder()
             .json_schema(self.schema.clone())
@@ -272,7 +272,7 @@ fn review_schema() -> String {
     .to_string()
 }
 
-fn build_prompt(commits: &[String], repo_location: &str, previous: &[PostedComment]) -> String {
+fn build_prompt(commits: &[String], repo_location: &str, previous: &[OpenComment]) -> String {
     let mut prompt = format!(
         "You are Repo Guardian's automated PR reviewer.\n\n\
          Repository checkout: {repo_location}\n\
@@ -372,9 +372,9 @@ mod tests {
         }
     }
 
-    fn previous_comment() -> PostedComment {
-        PostedComment {
-            comment_id: Some(11),
+    fn previous_comment() -> OpenComment {
+        OpenComment {
+            thread_id: "PRRT_thread".into(),
             comment: Comment {
                 severity: Severity::Bug,
                 text: "off-by-one in pagination".into(),
