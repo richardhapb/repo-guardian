@@ -133,30 +133,40 @@ impl GhClient {
 
     /// The PR's unresolved Guardian review threads (first comment carries
     /// the marker or a legacy severity badge), ready to replay in the next
-    /// review prompt and to resolve by thread id.
+    /// review prompt and to resolve by thread id. Pages through all threads
+    /// so long-lived PRs don't drop comments past the first 100.
     pub async fn open_guardian_comments(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
     ) -> Result<Vec<OpenComment>, Error> {
-        let query = json!({
-            "query": "query($owner:String!,$name:String!,$number:Int!){\
-                repository(owner:$owner,name:$name){\
-                    pullRequest(number:$number){\
-                        reviewThreads(first:100){\
-                            nodes{id isResolved comments(first:1){\
-                                nodes{body path line startLine originalLine originalStartLine}\
-                            }}\
+        let mut open = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let query = json!({
+                "query": "query($owner:String!,$name:String!,$number:Int!,$cursor:String){\
+                    repository(owner:$owner,name:$name){\
+                        pullRequest(number:$number){\
+                            reviewThreads(first:100,after:$cursor){\
+                                pageInfo{hasNextPage endCursor}\
+                                nodes{id isResolved comments(first:1){\
+                                    nodes{body path line startLine originalLine originalStartLine}\
+                                }}\
+                            }\
                         }\
                     }\
-                }\
-            }",
-            "variables": { "owner": owner, "name": repo, "number": number },
-        });
-        let data: serde_json::Value = self.crab.graphql(&query).await?;
-        check_graphql_errors(&data)?;
-        Ok(parse_open_threads(&data))
+                }",
+                "variables": { "owner": owner, "name": repo, "number": number, "cursor": cursor },
+            });
+            let data: serde_json::Value = self.crab.graphql(&query).await?;
+            check_graphql_errors(&data)?;
+            open.extend(parse_open_threads(&data));
+            match next_cursor(&data) {
+                Some(next) => cursor = Some(next),
+                None => return Ok(open),
+            }
+        }
     }
 
     /// Resolves the given review threads (GraphQL node ids). Thread
@@ -198,6 +208,16 @@ fn check_graphql_errors(data: &serde_json::Value) -> Result<(), Error> {
             Err(format!("GraphQL errors: {}", serde_json::Value::Array(errors.clone())).into())
         }
         _ => Ok(()),
+    }
+}
+
+/// The cursor for the next reviewThreads page, `None` on the last page.
+fn next_cursor(data: &serde_json::Value) -> Option<String> {
+    let page = data.pointer("/data/repository/pullRequest/reviewThreads/pageInfo")?;
+    if page["hasNextPage"].as_bool()? {
+        page["endCursor"].as_str().map(str::to_owned)
+    } else {
+        None
     }
 }
 
@@ -383,6 +403,28 @@ mod tests {
         let open = parse_open_threads(&data);
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].comment.lines, LineRange { start: 7, end: 7 });
+    }
+
+    #[test]
+    fn next_cursor_follows_pagination_until_the_last_page() {
+        let more = serde_json::json!({
+            "data": { "repository": { "pullRequest": { "reviewThreads": {
+                "pageInfo": { "hasNextPage": true, "endCursor": "abc" },
+                "nodes": []
+            } } } }
+        });
+        assert_eq!(next_cursor(&more), Some("abc".to_owned()));
+
+        let last = serde_json::json!({
+            "data": { "repository": { "pullRequest": { "reviewThreads": {
+                "pageInfo": { "hasNextPage": false, "endCursor": "abc" },
+                "nodes": []
+            } } } }
+        });
+        assert_eq!(next_cursor(&last), None);
+
+        // a malformed page never loops forever
+        assert_eq!(next_cursor(&serde_json::json!({ "data": {} })), None);
     }
 
     #[test]

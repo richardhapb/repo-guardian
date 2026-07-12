@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::{
     App,
-    github::{ReviewSubmission, ReviewVerdict, payload::PullRequestWH},
+    github::{OpenComment, ReviewSubmission, ReviewVerdict, payload::PullRequestWH},
     guardian::{Comment, ReviewResult, Severity},
     repos,
     state::BeginReview,
@@ -95,12 +95,7 @@ async fn review_round(
 
     // Guardian said which earlier comments the new code fixes; resolve their
     // threads on GitHub.
-    let fixed_threads: Vec<String> = result
-        .resolved_previous
-        .iter()
-        .filter_map(|&i| previous.get(i))
-        .map(|p| p.thread_id.clone())
-        .collect();
+    let fixed_threads = fixed_thread_ids(&result.resolved_previous, &previous);
     let mut resolved = 0;
     if !fixed_threads.is_empty() {
         resolved = app.gh.resolve_threads(&fixed_threads).await?;
@@ -150,6 +145,20 @@ async fn review_round(
     }
 
     Ok(())
+}
+
+/// Thread ids of the previously-open comments the model marked fixed.
+/// `resolved_previous` comes straight from the model: out-of-range indices
+/// are dropped and repeats deduplicated so the resolved count stays honest.
+fn fixed_thread_ids(resolved_previous: &[usize], previous: &[OpenComment]) -> Vec<String> {
+    let mut ids: Vec<String> = resolved_previous
+        .iter()
+        .filter_map(|&i| previous.get(i))
+        .map(|p| p.thread_id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 /// Guardian is asked to approve only without bug findings; enforce that here
@@ -213,6 +222,21 @@ mod tests {
             file: "src/a.rs".into(),
             lines: LineRange { start: 1, end: 1 },
         }
+    }
+
+    #[test]
+    fn fixed_thread_ids_drop_out_of_range_and_repeated_indices() {
+        let previous: Vec<OpenComment> = ["T_a", "T_b"]
+            .into_iter()
+            .map(|id| OpenComment {
+                thread_id: id.into(),
+                comment: comment(Severity::Nit),
+            })
+            .collect();
+
+        // the model repeated index 1 and invented index 9
+        let ids = fixed_thread_ids(&[1, 9, 1, 0], &previous);
+        assert_eq!(ids, vec!["T_a".to_owned(), "T_b".to_owned()]);
     }
 
     #[test]
