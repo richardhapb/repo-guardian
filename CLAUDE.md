@@ -84,6 +84,9 @@ comment), optionally auto-merging.
   the `#[launch]` fn must be `async`, and the builder is `!Send` so it must be
   scoped in a block (not held across an `.await`). Same reason webhook tests
   use `rocket::local::asynchronous` + `#[rocket::async_test]`.
+- octocrab's `Error` Display prints only the outer variant (`GitHub`) — the
+  API message hides in `source()`. Log errors through `pipeline::error_chain`
+  or failures are undiagnosable.
 - `octocrab.graphql()` returns `Ok` on HTTP 200 even when the payload carries
   an `errors` array — every GraphQL call must go through
   `check_graphql_errors` or a denied mutation silently counts as success
