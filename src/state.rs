@@ -1,32 +1,23 @@
 //! Per-PR review state, persisted as JSON.
 //!
-//! Tracking exists for two reasons: idempotency (the same head sha is never
-//! reviewed twice, and concurrent/redelivered webhooks are deduplicated) and
-//! auto-resolution (open comments are carried across pushes so Guardian can
-//! mark the ones the new code fixes). The attempt/review caps are the
-//! safeguard against review loops.
+//! Tracking exists for idempotency: the same head sha is never reviewed
+//! twice, and concurrent/redelivered webhooks are deduplicated. The
+//! attempt/review caps are the safeguard against review loops. Open review
+//! comments are NOT tracked here -- GitHub's unresolved review threads are
+//! the source of truth for those (see `GhClient::open_guardian_comments`).
 
 use std::{collections::HashMap, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::{config::ReviewLimits, guardian::Comment};
+use crate::config::ReviewLimits;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewStatus {
     InProgress,
     Reviewed,
     Failed,
-}
-
-/// A comment we posted on GitHub. `comment_id` is the review-comment database
-/// id, used to resolve its thread later; `None` when GitHub dropped or
-/// re-anchored the comment and we could not match it back.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PostedComment {
-    pub comment_id: Option<u64>,
-    pub comment: Comment,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,8 +28,6 @@ pub struct PrState {
     pub attempts_on_sha: u32,
     /// Completed reviews over the PR's lifetime.
     pub total_reviews: u32,
-    /// Comments posted in earlier rounds that are still open.
-    pub comments: Vec<PostedComment>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -97,9 +86,7 @@ impl StateStore {
                 BeginReview::ReviewCapReached
             }
             existing => {
-                let (comments, total_reviews) = existing
-                    .map(|s| (s.comments.clone(), s.total_reviews))
-                    .unwrap_or_default();
+                let total_reviews = existing.map(|s| s.total_reviews).unwrap_or_default();
                 prs.insert(
                     key.to_owned(),
                     PrState {
@@ -107,7 +94,6 @@ impl StateStore {
                         status: ReviewStatus::InProgress,
                         attempts_on_sha: 1,
                         total_reviews,
-                        comments,
                     },
                 );
                 self.persist(&prs);
@@ -116,22 +102,11 @@ impl StateStore {
         }
     }
 
-    /// Comments from earlier rounds that are still open on GitHub.
-    pub async fn open_comments(&self, key: &str) -> Vec<PostedComment> {
-        self.prs
-            .lock()
-            .await
-            .get(key)
-            .map(|s| s.comments.clone())
-            .unwrap_or_default()
-    }
-
-    pub async fn finish_review(&self, key: &str, comments: Vec<PostedComment>) {
+    pub async fn finish_review(&self, key: &str) {
         let mut prs = self.prs.lock().await;
         if let Some(state) = prs.get_mut(key) {
             state.status = ReviewStatus::Reviewed;
             state.total_reviews += 1;
-            state.comments = comments;
         }
         self.persist(&prs);
     }
@@ -157,22 +132,9 @@ impl StateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guardian::{LineRange, Severity};
 
     fn store(dir: &tempfile::TempDir) -> StateStore {
         StateStore::load(dir.path().join("state.json"), ReviewLimits::default()).unwrap()
-    }
-
-    fn posted(text: &str) -> PostedComment {
-        PostedComment {
-            comment_id: Some(7),
-            comment: Comment {
-                severity: Severity::Design,
-                text: text.into(),
-                file: "src/a.rs".into(),
-                lines: LineRange { start: 1, end: 2 },
-            },
-        }
     }
 
     #[tokio::test]
@@ -186,7 +148,7 @@ mod tests {
             store.begin_review("r#1", "aaa").await,
             BeginReview::AlreadyHandled
         );
-        store.finish_review("r#1", vec![]).await;
+        store.finish_review("r#1").await;
         // already reviewed
         assert_eq!(
             store.begin_review("r#1", "aaa").await,
@@ -227,27 +189,12 @@ mod tests {
 
         for sha in ["aaa", "bbb"] {
             assert_eq!(store.begin_review("r#1", sha).await, BeginReview::Proceed);
-            store.finish_review("r#1", vec![]).await;
+            store.finish_review("r#1").await;
         }
         assert_eq!(
             store.begin_review("r#1", "ccc").await,
             BeginReview::ReviewCapReached
         );
-    }
-
-    #[tokio::test]
-    async fn comments_carry_over_to_the_next_round() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(&dir);
-
-        store.begin_review("r#1", "aaa").await;
-        store.finish_review("r#1", vec![posted("open finding")]).await;
-
-        // new push keeps previous open comments available for the prompt
-        store.begin_review("r#1", "bbb").await;
-        let open = store.open_comments("r#1").await;
-        assert_eq!(open.len(), 1);
-        assert_eq!(open[0].comment.text, "open finding");
     }
 
     #[tokio::test]
@@ -269,7 +216,7 @@ mod tests {
         {
             let store = StateStore::load(path.clone(), ReviewLimits::default()).unwrap();
             store.begin_review("r#1", "aaa").await;
-            store.finish_review("r#1", vec![posted("kept")]).await;
+            store.finish_review("r#1").await;
         }
 
         let store = StateStore::load(path, ReviewLimits::default()).unwrap();
@@ -277,6 +224,40 @@ mod tests {
             store.begin_review("r#1", "aaa").await,
             BeginReview::AlreadyHandled
         );
-        assert_eq!(store.open_comments("r#1").await[0].comment.text, "kept");
+    }
+
+    #[tokio::test]
+    async fn state_files_with_legacy_comments_still_load() {
+        // .state.json written before comment tracking moved to GitHub
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "r#1": {
+                    "head_sha": "aaa",
+                    "status": "Reviewed",
+                    "attempts_on_sha": 1,
+                    "total_reviews": 1,
+                    "comments": [{
+                        "comment_id": 7,
+                        "comment": {
+                            "severity": "design",
+                            "text": "t",
+                            "file": "src/a.rs",
+                            "lines": {"start": 1, "end": 2}
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = StateStore::load(path, ReviewLimits::default()).unwrap();
+        assert_eq!(
+            store.begin_review("r#1", "aaa").await,
+            BeginReview::AlreadyHandled
+        );
     }
 }
