@@ -1,0 +1,11 @@
+[package]
+name = "repo-guardian"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+claude-code = { version = "0.1.2", features = ["structured"] }
+octocrab = "0.54.0"
+rocket = { version = "0.5.1", features = ["json", "serde_json"] }
+serde = "1.0.228"
