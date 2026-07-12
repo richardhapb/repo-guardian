@@ -6,6 +6,18 @@ edition = "2024"
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
 claude-code = { version = "0.1.2", features = ["structured"] }
+hex = "0.4"
+hmac = "0.12"
 octocrab = "0.54.0"
 rocket = { version = "0.5.1", features = ["json", "serde_json"] }
-serde = "1.0.228"
+schemars = "1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["process"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

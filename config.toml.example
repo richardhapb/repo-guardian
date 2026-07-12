@@ -1,0 +1,12 @@
+# Repo Guardian configuration. Copy to config.toml.
+# Secrets come from the environment, not this file:
+#   GITHUB_WEBHOOK_SECRET  (required) shared secret of the GitHub webhook
+#   GITHUB_TOKEN           (optional) token for API calls and private clones
+
+auto_merge = false
+repos_path = "/var/lib/repo-guardian/repos"
+
+# Optional -- defaults shown.
+# state_path = "/var/lib/repo-guardian/repos/.state.json"
+# max_attempts_per_sha = 3   # failed-review retries per head sha
+# max_reviews_per_pr = 20    # lifetime review cap per PR (loop safeguard)
