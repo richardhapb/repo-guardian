@@ -47,7 +47,7 @@ pub async fn process(app: Arc<App>, event: PullRequestWH) {
                 %key,
                 sha = %head_sha,
                 elapsed_s = started.elapsed().as_secs_f32(),
-                error = %e,
+                error = %error_chain(e.as_ref()),
                 "review failed"
             );
         }
@@ -110,20 +110,40 @@ async fn review_round(
         .username
         .as_deref()
         .is_some_and(|user| author == Some(user));
-    let review_id = app
-        .gh
-        .submit_review(
-            owner,
-            name,
-            pr,
-            ReviewSubmission {
-                commit_id: head_sha,
-                verdict: choose_verdict(approved, own_pr),
-                body: &review_body(approved, own_pr, &result.comments, resolved),
-                comments: &result.comments,
-            },
-        )
-        .await?;
+    let verdict = choose_verdict(approved, own_pr);
+    let body = review_body(approved, own_pr, &result.comments, resolved);
+    let submission = ReviewSubmission {
+        commit_id: head_sha,
+        verdict,
+        body: &body,
+        comments: &result.comments,
+    };
+    let review_id = match app.gh.submit_review(owner, name, pr, submission).await {
+        Ok(id) => id,
+        // GitHub rejects the whole review when any inline anchor falls
+        // outside the diff; the findings still must land, so retry with
+        // them folded into the review body.
+        Err(e) => {
+            tracing::warn!(
+                %key,
+                error = %error_chain(&e),
+                "inline review rejected; retrying without inline comments"
+            );
+            app.gh
+                .submit_review(
+                    owner,
+                    name,
+                    pr,
+                    ReviewSubmission {
+                        commit_id: head_sha,
+                        verdict,
+                        body: &fallback_body(&body, &result.comments),
+                        comments: &[],
+                    },
+                )
+                .await?
+        }
+    };
     tracing::info!(
         %key,
         review_id,
@@ -145,6 +165,40 @@ async fn review_round(
     }
 
     Ok(())
+}
+
+/// Full error chain, since some `Display` impls (octocrab's GitHub variant)
+/// print only the outermost layer and bury the API message in `source()`.
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
+/// Review body carrying the inline comments as plain text, for when GitHub
+/// rejects the anchored submission.
+fn fallback_body(body: &str, comments: &[Comment]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = format!(
+        "{body}\n---\n_GitHub rejected the inline anchors; findings listed here instead._\n"
+    );
+    for c in comments {
+        let _ = write!(
+            out,
+            "\n**`{}:{}`** {}\n\n{}\n",
+            c.file,
+            c.lines,
+            c.severity.badge(),
+            c.text
+        );
+    }
+    out
 }
 
 /// Thread ids of the previously-open comments the model marked fixed.
@@ -294,6 +348,36 @@ mod tests {
         assert!(body.contains("| \u{1f7e1} **Design** | 1 |"));
         // zero-count severities are omitted from the table
         assert!(!body.contains("**Nit**"));
+    }
+
+    #[test]
+    fn error_chain_prints_buried_sources() {
+        #[derive(Debug)]
+        struct Opaque(std::io::Error);
+        impl std::fmt::Display for Opaque {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "GitHub")
+            }
+        }
+        impl std::error::Error for Opaque {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let e = Opaque(std::io::Error::other("line must be part of the diff"));
+        assert_eq!(error_chain(&e), "GitHub: line must be part of the diff");
+    }
+
+    #[test]
+    fn fallback_body_folds_findings_into_the_review_body() {
+        let body = review_body(false, false, &[comment(Severity::Bug)], 0);
+        let out = fallback_body(&body, &[comment(Severity::Bug)]);
+
+        assert!(out.contains("Changes requested"));
+        assert!(out.contains("inline anchors"));
+        assert!(out.contains("**`src/a.rs:1`** \u{1f534} **Bug**"));
+        assert!(out.contains("\nfinding\n"));
     }
 
     #[test]
