@@ -18,7 +18,8 @@ use crate::github::OpenComment;
 pub enum Severity {
     /// Wrong behavior, regressions, broken invariants. Blocks approval.
     Bug,
-    /// Scope creep, API shape, boundary leaks. Worth pushing back, not blocking.
+    /// Scope creep, API shape, boundary leaks. Also blocks approval: a fix
+    /// is requested, only nit-severity findings may pass.
     Design,
     /// Minor polish, optional.
     Nit,
@@ -235,7 +236,7 @@ fn review_schema() -> String {
         "properties": {
             "approved": {
                 "type": "boolean",
-                "description": "True only when there are no bug-severity findings."
+                "description": "True only when every finding is nit severity."
             },
             "comments": {
                 "type": "array",
@@ -293,8 +294,8 @@ fn build_prompt(commits: &[String], repo_location: &str, previous: &[OpenComment
          Only report real, actionable findings; do not pad the review.\n\n\
          Assign each comment a severity:\n\
          - bug: wrong behavior, regressions, broken invariants (blocks approval)\n\
-         - design: scope creep, API shape, boundary leaks (push back, not blocking)\n\
-         - nit: minor polish (optional)\n",
+         - design: scope creep, API shape, boundary leaks (blocks approval, a fix is requested)\n\
+         - nit: minor polish (optional, does not block)\n",
     );
     if !previous.is_empty() {
         prompt.push_str(
@@ -314,8 +315,8 @@ fn build_prompt(commits: &[String], repo_location: &str, previous: &[OpenComment
         );
     }
     prompt.push_str(
-        "\nReturn the structured result: `approved` must be true only when there are no \
-         bug-severity findings; `comments` entries use file paths relative to the repo root \
+        "\nReturn the structured result: `approved` must be true only when every finding \
+         is nit severity; `comments` entries use file paths relative to the repo root \
          and line ranges in the new version of the file.\n",
     );
     prompt

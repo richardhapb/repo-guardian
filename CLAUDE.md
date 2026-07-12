@@ -41,11 +41,12 @@ comment), optionally auto-merging.
   `claude-code` crate runs the CLI as a subprocess with `--json-schema`.
   It's generic over `CommandRunner` so tests inject a fake runner.
 - **All comments go up as ONE review** per round, never individual comments.
-- **Severities** (mr-review taxonomy): `bug` blocks approval, `design` pushes
-  back without blocking, `nit` is optional polish. The pipeline vetoes
-  `approved` if any bug-severity comment exists (defense against inconsistent
-  model output). Comment bodies: `[Repo Guardian] 🔴 **Bug**` / `🟡 **Design**`
-  / `🟢 **Nit**` — the marker is how the next round recognizes its own threads.
+- **Severities** (mr-review taxonomy): anything above `nit` blocks — `bug`
+  and `design` both request a fix; `nit` is optional polish and the only
+  severity that may pass. The pipeline vetoes `approved` if any comment above
+  nit exists (defense against inconsistent model output). Comment bodies:
+  `[Repo Guardian] 🔴 **Bug**` / `🟡 **Design**` / `🟢 **Nit**` — the marker
+  is how the next round recognizes its own threads.
 - **Self-PR handling**: GitHub rejects APPROVE and REQUEST_CHANGES on your own
   PR. The authenticated login is fetched at boot (`octocrab.current().user()`,
   no config field); matching PRs get a neutral COMMENT review whose body
@@ -83,6 +84,9 @@ comment), optionally auto-merging.
   the `#[launch]` fn must be `async`, and the builder is `!Send` so it must be
   scoped in a block (not held across an `.await`). Same reason webhook tests
   use `rocket::local::asynchronous` + `#[rocket::async_test]`.
+- octocrab's `Error` Display prints only the outer variant (`GitHub`) — the
+  API message hides in `source()`. Log errors through `pipeline::error_chain`
+  or failures are undiagnosable.
 - `octocrab.graphql()` returns `Ok` on HTTP 200 even when the payload carries
   an `errors` array — every GraphQL call must go through
   `check_graphql_errors` or a denied mutation silently counts as success
