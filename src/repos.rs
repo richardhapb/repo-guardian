@@ -34,10 +34,16 @@ impl From<std::io::Error> for RepoError {
     }
 }
 
-/// Returns the local checkout for `repo`, cloning it under
-/// `<repos_path>/<owner>/<name>` on first sight and fetching otherwise.
+/// Returns the local checkout for `repo`. A pre-existing checkout at
+/// `<repos_path>/<name>` (no owner prefix) whose origin points at the same
+/// repository is reused, so a deployment can share clones made by hand;
+/// otherwise the repo lives under `<repos_path>/<owner>/<name>`, cloned on
+/// first sight and fetched afterwards.
 pub async fn resolve(repos_path: &Path, repo: &Repository) -> Result<PathBuf, RepoError> {
-    let dest = repos_path.join(&repo.full_name);
+    let dest = match existing_checkout(repos_path, repo).await {
+        Some(found) => found,
+        None => repos_path.join(&repo.full_name),
+    };
     if dest.join(".git").exists() {
         git(&dest, &["fetch", "origin"]).await?;
     } else {
@@ -49,6 +55,25 @@ pub async fn resolve(repos_path: &Path, repo: &Repository) -> Result<PathBuf, Re
         git(repos_path, &["clone", &repo.clone_url, &dest_str]).await?;
     }
     Ok(dest)
+}
+
+/// The hand-made checkout at `<repos_path>/<name>`, if it exists and its
+/// origin is the same repository (https or ssh URL, `.git` suffix or not).
+async fn existing_checkout(repos_path: &Path, repo: &Repository) -> Option<PathBuf> {
+    let dest = repos_path.join(&repo.name);
+    if !dest.join(".git").exists() {
+        return None;
+    }
+    let origin = git_stdout(&dest, &["remote", "get-url", "origin"])
+        .await
+        .ok()?;
+    origin_matches(&origin, &repo.full_name).then_some(dest)
+}
+
+fn origin_matches(origin: &str, full_name: &str) -> bool {
+    let origin = origin.trim().trim_end_matches('/');
+    let origin = origin.strip_suffix(".git").unwrap_or(origin);
+    origin.ends_with(&format!("/{full_name}")) || origin.ends_with(&format!(":{full_name}"))
 }
 
 /// Fetches the PR's head so its commits are inspectable locally. GitHub
@@ -106,6 +131,10 @@ const CREDENTIAL_HELPER: &str =
     r#"!f() { echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f"#;
 
 async fn git(cwd: &Path, args: &[&str]) -> Result<(), RepoError> {
+    git_stdout(cwd, args).await.map(|_| ())
+}
+
+async fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String, RepoError> {
     tracing::debug!(cwd = %cwd.display(), ?args, "git");
     let mut cmd = Command::new("git");
     if std::env::var("GITHUB_TOKEN").is_ok_and(|t| !t.is_empty()) {
@@ -113,7 +142,7 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<(), RepoError> {
     }
     let output = cmd.args(args).current_dir(cwd).output().await?;
     if output.status.success() {
-        Ok(())
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
         Err(RepoError::Git {
             args: args.iter().map(|s| s.to_string()).collect(),
@@ -141,7 +170,8 @@ mod tests {
     }
 
     fn upstream(dir: &Path) -> Repository {
-        let origin = dir.join("origin");
+        // path ends in the full_name, like a real remote URL does
+        let origin = dir.join("upstream/octocat/repo");
         std::fs::create_dir_all(&origin).unwrap();
         run(&origin, &["init", "-b", "main"]);
         run(&origin, &["config", "user.email", "t@t"]);
@@ -226,7 +256,7 @@ mod tests {
         assert_eq!(read(&checkout), "hello\n");
 
         // a new push moves the existing worktree to the new head
-        let origin = dir.path().join("origin");
+        let origin = dir.path().join("upstream/octocat/repo");
         run(&origin, &["checkout", "pr"]);
         std::fs::write(origin.join("a.txt"), "pr v2\n").unwrap();
         run(&origin, &["commit", "-am", "pr push"]);
@@ -242,6 +272,53 @@ mod tests {
         assert!(!worktree.exists());
         // removing an already-removed worktree is a no-op
         remove_pr_worktree(&checkout, 7).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolve_reuses_an_unprefixed_checkout_with_matching_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let repos_path = dir.path().join("repos");
+        std::fs::create_dir_all(&repos_path).unwrap();
+        let repo = upstream(dir.path());
+
+        // a hand-made clone at <repos_path>/<name>, no owner prefix
+        run(&repos_path, &["clone", &repo.clone_url, "repo"]);
+
+        let checkout = resolve(&repos_path, &repo).await.unwrap();
+        assert_eq!(checkout, repos_path.join("repo"));
+        assert!(!repos_path.join("octocat/repo").exists());
+    }
+
+    #[tokio::test]
+    async fn resolve_ignores_an_unrelated_unprefixed_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let repos_path = dir.path().join("repos");
+        std::fs::create_dir_all(&repos_path).unwrap();
+        let repo = upstream(dir.path());
+
+        // same name, different repository
+        let unrelated = repos_path.join("repo");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        run(&unrelated, &["init"]);
+        run(
+            &unrelated,
+            &["remote", "add", "origin", "https://github.com/other/repo.git"],
+        );
+
+        let checkout = resolve(&repos_path, &repo).await.unwrap();
+        assert_eq!(checkout, repos_path.join("octocat/repo"));
+    }
+
+    #[test]
+    fn origin_matching_handles_url_shapes() {
+        let f = "octocat/repo";
+        assert!(origin_matches("https://github.com/octocat/repo.git", f));
+        assert!(origin_matches("git@github.com:octocat/repo", f));
+        assert!(origin_matches("git@github.com:octocat/repo.git\n", f));
+        assert!(!origin_matches("https://github.com/other/repo.git", f));
+        assert!(!origin_matches("git@github.com:octocat/repository", f));
+        // name suffix overlap is not a match
+        assert!(!origin_matches("git@github.com:octocat/xrepo", f));
     }
 
     #[test]
