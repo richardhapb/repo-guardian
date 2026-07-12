@@ -98,13 +98,20 @@ pub async fn remove_pr_worktree(checkout: &Path, number: i32) -> Result<(), Repo
     git(checkout, &["worktree", "remove", "--force", &path_str]).await
 }
 
+/// Inline credential helper that hands `$GITHUB_TOKEN` to git at runtime.
+/// The token stays in the environment: it never appears in argv, in the
+/// checkout's .git/config, or in logged [`RepoError::Git`] args (the clone
+/// URL stays credential-free).
+const CREDENTIAL_HELPER: &str =
+    r#"!f() { echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f"#;
+
 async fn git(cwd: &Path, args: &[&str]) -> Result<(), RepoError> {
     tracing::debug!(cwd = %cwd.display(), ?args, "git");
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .await?;
+    let mut cmd = Command::new("git");
+    if std::env::var("GITHUB_TOKEN").is_ok_and(|t| !t.is_empty()) {
+        cmd.args(["-c", &format!("credential.helper={CREDENTIAL_HELPER}")]);
+    }
+    let output = cmd.args(args).current_dir(cwd).output().await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -235,6 +242,41 @@ mod tests {
         assert!(!worktree.exists());
         // removing an already-removed worktree is a no-op
         remove_pr_worktree(&checkout, 7).await.unwrap();
+    }
+
+    #[test]
+    fn credential_helper_feeds_the_token_from_env() {
+        use std::io::Write;
+
+        // isolated config so only the inline helper answers
+        let home = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("git")
+            .args([
+                "-c",
+                &format!("credential.helper={CREDENTIAL_HELPER}"),
+                "credential",
+                "fill",
+            ])
+            .env("GITHUB_TOKEN", "tok-123")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=github.com\n\n")
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success());
+        assert!(stdout.contains("username=x-access-token"), "{stdout}");
+        assert!(stdout.contains("password=tok-123"), "{stdout}");
     }
 
     #[tokio::test]
