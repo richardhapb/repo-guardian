@@ -200,12 +200,18 @@ impl CliResponse {
                     source: e,
                 }
             }),
-            None => serde_json::from_str(&self.result).map_err(|e| {
-                ClaudeError::StructuredOutputError {
-                    raw_result: self.result,
-                    source: e,
-                }
-            }),
+            None => {
+                tracing::warn!(
+                    result = %&self.result[..self.result.len().min(2000)],
+                    "no structured_output in the CLI response; parsing `result`"
+                );
+                serde_json::from_str(&self.result).map_err(|e| {
+                    ClaudeError::StructuredOutputError {
+                        raw_result: self.result,
+                        source: e,
+                    }
+                })
+            }
         }
     }
 }
