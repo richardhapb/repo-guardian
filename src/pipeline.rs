@@ -161,11 +161,11 @@ fn fixed_thread_ids(resolved_previous: &[usize], previous: &[OpenComment]) -> Ve
     ids
 }
 
-/// Guardian is asked to approve only without bug findings; enforce that here
-/// too so an inconsistent result can never approve (or auto-merge) a PR
-/// with an open bug.
+/// Guardian is asked to approve only when nothing above nit severity is
+/// found; enforce that here too so an inconsistent result can never approve
+/// (or auto-merge) a PR with an open bug or design finding.
 fn decide_approval(result: &ReviewResult) -> bool {
-    result.approved && result.comments.iter().all(|c| c.severity != Severity::Bug)
+    result.approved && result.comments.iter().all(|c| c.severity == Severity::Nit)
 }
 
 fn choose_verdict(approved: bool, own_pr: bool) -> ReviewVerdict {
@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_is_vetoed_by_bug_comments() {
+    fn approval_is_vetoed_by_findings_above_nit() {
         let result = ReviewResult {
             approved: true,
             comments: vec![comment(Severity::Bug), comment(Severity::Nit)],
@@ -248,9 +248,17 @@ mod tests {
         };
         assert!(!decide_approval(&result));
 
+        // design findings ask for a fix too; only nits may pass
         let result = ReviewResult {
             approved: true,
             comments: vec![comment(Severity::Design), comment(Severity::Nit)],
+            resolved_previous: vec![],
+        };
+        assert!(!decide_approval(&result));
+
+        let result = ReviewResult {
+            approved: true,
+            comments: vec![comment(Severity::Nit)],
             resolved_previous: vec![],
         };
         assert!(decide_approval(&result));
