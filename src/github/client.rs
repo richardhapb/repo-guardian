@@ -28,7 +28,7 @@ impl ReviewVerdict {
     }
 }
 
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Body posted to GitHub for an inline comment: marker and severity badge
 /// as a heading line, then the finding.
@@ -162,10 +162,10 @@ impl GhClient {
                 "variables": { "owner": owner, "name": repo, "number": number, "cursor": cursor },
             });
             let data: serde_json::Value = self.crab.graphql(&query).await?;
-            info!(?data);
+            debug!(threads_repsonse = ?data);
             check_graphql_errors(&data)?;
             let open_threads = parse_open_threads(&data);
-            info!(open_threads = %open_threads.len());
+            debug!(?open_threads);
             open.extend(open_threads);
             match next_cursor(&data) {
                 Some(next) => cursor = Some(next),
@@ -222,7 +222,7 @@ fn check_graphql_errors(data: &serde_json::Value) -> Result<(), Error> {
 
 /// The cursor for the next reviewThreads page, `None` on the last page.
 fn next_cursor(data: &serde_json::Value) -> Option<String> {
-    let page = data.pointer("/data/repository/pullRequest/reviewThreads/pageInfo")?;
+    let page = data.pointer("/repository/pullRequest/reviewThreads/pageInfo")?;
     if page["hasNextPage"].as_bool()? {
         page["endCursor"].as_str().map(str::to_owned)
     } else {
@@ -235,12 +235,12 @@ fn next_cursor(data: &serde_json::Value) -> Option<String> {
 /// badge) are someone else's conversation and are skipped.
 fn parse_open_threads(data: &serde_json::Value) -> Vec<OpenComment> {
     let threads = data
-        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+        .pointer("/repository/pullRequest/reviewThreads/nodes")
         .and_then(|v| v.as_array())
         .map(Vec::as_slice)
         .unwrap_or_default();
 
-    info!(?threads);
+    debug!(?threads);
 
     threads
         .iter()
@@ -329,7 +329,7 @@ mod tests {
 
     fn threads_response(threads: Vec<serde_json::Value>) -> serde_json::Value {
         serde_json::json!({
-            "data": { "repository": { "pullRequest": { "reviewThreads": { "nodes": threads } } } }
+            "repository": { "pullRequest": { "reviewThreads": { "nodes": threads } } }
         })
     }
 
@@ -418,19 +418,19 @@ mod tests {
     #[test]
     fn next_cursor_follows_pagination_until_the_last_page() {
         let more = serde_json::json!({
-            "data": { "repository": { "pullRequest": { "reviewThreads": {
+            "repository": { "pullRequest": { "reviewThreads": {
                 "pageInfo": { "hasNextPage": true, "endCursor": "abc" },
                 "nodes": []
             } } } }
-        });
+        );
         assert_eq!(next_cursor(&more), Some("abc".to_owned()));
 
         let last = serde_json::json!({
-            "data": { "repository": { "pullRequest": { "reviewThreads": {
+            "repository": { "pullRequest": { "reviewThreads": {
                 "pageInfo": { "hasNextPage": false, "endCursor": "abc" },
                 "nodes": []
             } } } }
-        });
+        );
         assert_eq!(next_cursor(&last), None);
 
         // a malformed page never loops forever
