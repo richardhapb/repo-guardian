@@ -162,9 +162,10 @@ impl GhClient {
                 "variables": { "owner": owner, "name": repo, "number": number, "cursor": cursor },
             });
             let data: serde_json::Value = self.crab.graphql(&query).await?;
+            info!(?data);
             check_graphql_errors(&data)?;
             let open_threads = parse_open_threads(&data);
-            info!(?open_threads);
+            info!(open_threads = %open_threads.len());
             open.extend(open_threads);
             match next_cursor(&data) {
                 Some(next) => cursor = Some(next),
@@ -238,6 +239,8 @@ fn parse_open_threads(data: &serde_json::Value) -> Vec<OpenComment> {
         .and_then(|v| v.as_array())
         .map(Vec::as_slice)
         .unwrap_or_default();
+
+    info!(?threads);
 
     threads
         .iter()
