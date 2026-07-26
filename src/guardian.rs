@@ -82,6 +82,8 @@ pub struct ReviewResult {
     /// the latest push resolved.
     #[serde(default)]
     pub resolved_previous: Vec<usize>,
+    #[serde(default)]
+    pub unresolved_previous: Vec<usize>,
 }
 
 pub struct Guardian<R: CommandRunner + Clone = DefaultRunner> {
@@ -267,6 +269,11 @@ fn review_schema() -> String {
                 "type": "array",
                 "description": "Indices of the previously-open comments that the latest push resolved.",
                 "items": {"type": "integer", "minimum": 0}
+            },
+            "unresolved_previous": {
+                "type": "array",
+                "description": "Indices of the previously-open comments that continue unresolved currently.",
+                "items": {"type": "integer", "minimum": 0}
             }
         },
         "required": ["approved", "comments"]
@@ -309,14 +316,16 @@ fn build_prompt(commits: &[String], repo_location: &str, previous: &[OpenComment
             );
         }
         prompt.push_str(
-            "If the latest code resolves one of them, put its index in `resolved_previous`. \
-             Do not re-report still-open ones as new comments.\n",
+            "If the latest code resolves one of them, put its index in `resolved_previous`; \
+             put the index of every one the latest code leaves open in \
+             `unresolved_previous`. Do not re-report still-open ones as new comments.\n",
         );
     }
     prompt.push_str(
         "\nReturn the structured result: `approved` must be true only when every finding \
-         is nit severity; `comments` entries use file paths relative to the repo root \
-         and line ranges in the new version of the file.\n",
+         is nit severity -- earlier findings left unresolved count as findings; `comments` \
+         entries use file paths relative to the repo root and line ranges in the new version \
+         of the file.\n",
     );
     prompt
 }
@@ -462,7 +471,12 @@ mod tests {
         }
         let schema: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let props = schema.get("properties").expect("schema has properties");
-        for field in ["approved", "comments", "resolved_previous"] {
+        for field in [
+            "approved",
+            "comments",
+            "resolved_previous",
+            "unresolved_previous",
+        ] {
             assert!(props.get(field).is_some(), "missing {field}");
         }
     }
@@ -478,11 +492,18 @@ mod tests {
                 "file": "src/a.rs",
                 "lines": {"start": 1, "end": 2}
             }],
-            "resolved_previous": [0, 3]
+            "resolved_previous": [0, 3],
+            "unresolved_previous": [1]
         });
         let result: ReviewResult = serde_json::from_value(sample).unwrap();
         assert_eq!(result.comments[0].severity, Severity::Design);
         assert_eq!(result.resolved_previous, vec![0, 3]);
+        assert_eq!(result.unresolved_previous, vec![1]);
+
+        // old CLI output without the index fields still parses
+        let bare = serde_json::json!({"approved": true, "comments": []});
+        let result: ReviewResult = serde_json::from_value(bare).unwrap();
+        assert!(result.unresolved_previous.is_empty());
 
         // every severity the schema's enum lists round-trips
         let schema: serde_json::Value = serde_json::from_str(&review_schema()).unwrap();
@@ -499,7 +520,16 @@ mod tests {
     fn prompt_omits_previous_section_when_empty() {
         let prompt = build_prompt(&["abc".into()], "/repos/r", &[]);
         assert!(!prompt.contains("earlier rounds"));
+        assert!(!prompt.contains("unresolved_previous"));
         assert!(prompt.contains("- abc"));
+    }
+
+    #[test]
+    fn prompt_asks_for_the_indices_of_previous_comments_left_open() {
+        let prompt = build_prompt(&["abc".into()], "/repos/r", &[previous_comment()]);
+        assert!(prompt.contains("0. [bug] src/page.rs (4:9): off-by-one in pagination"));
+        assert!(prompt.contains("resolved_previous"));
+        assert!(prompt.contains("unresolved_previous"));
     }
 
     #[test]
