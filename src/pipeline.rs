@@ -11,6 +11,8 @@ use crate::{
     state::BeginReview,
 };
 
+use tracing::{error, info, warn};
+
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub async fn process(app: Arc<App>, event: PullRequestWH) {
@@ -26,16 +28,26 @@ pub async fn process(app: Arc<App>, event: PullRequestWH) {
     match app.store.begin_review(&key, &head_sha).await {
         BeginReview::Proceed => {}
         skip => {
-            tracing::info!(%key, sha = %head_sha, reason = ?skip, "review skipped");
+            info!(%key, sha = %head_sha, reason = ?skip, "review skipped");
             return;
         }
     }
 
-    tracing::info!(%key, sha = %head_sha, "review started");
+    info!(%key, sha = %head_sha, "review started");
     let started = std::time::Instant::now();
     let author = pull_request.user.login.as_deref();
-    match review_round(&app, &repository, author, number, &key, &head_sha, synchronize).await {
-        Ok(()) => tracing::info!(
+    match review_round(
+        &app,
+        &repository,
+        author,
+        number,
+        &key,
+        &head_sha,
+        synchronize,
+    )
+    .await
+    {
+        Ok(()) => info!(
             %key,
             sha = %head_sha,
             elapsed_s = started.elapsed().as_secs_f32(),
@@ -43,7 +55,7 @@ pub async fn process(app: Arc<App>, event: PullRequestWH) {
         ),
         Err(e) => {
             app.store.mark_failed(&key).await;
-            tracing::error!(
+            error!(
                 %key,
                 sha = %head_sha,
                 elapsed_s = started.elapsed().as_secs_f32(),
@@ -89,7 +101,7 @@ async fn review_round(
         .await;
     // the worktree is only for Guardian; a leftover one is recreated next round
     if let Err(e) = repos::remove_pr_worktree(&checkout, number).await {
-        tracing::warn!(%key, error = %e, "failed to remove worktree");
+        warn!(%key, error = %e, "failed to remove worktree");
     }
     let result = result?;
 
@@ -99,7 +111,7 @@ async fn review_round(
     let mut resolved = 0;
     if !fixed_threads.is_empty() {
         resolved = app.gh.resolve_threads(&fixed_threads).await?;
-        tracing::info!(%key, resolved, "resolved fixed comment threads");
+        info!(%key, resolved, "resolved fixed comment threads");
     }
 
     let approved = decide_approval(&result);
@@ -124,7 +136,7 @@ async fn review_round(
         // outside the diff; the findings still must land, so retry with
         // them folded into the review body.
         Err(e) => {
-            tracing::warn!(
+            warn!(
                 %key,
                 error = %error_chain(&e),
                 "inline review rejected; retrying without inline comments"
@@ -144,7 +156,7 @@ async fn review_round(
                 .await?
         }
     };
-    tracing::info!(
+    info!(
         %key,
         review_id,
         approved,
@@ -159,8 +171,8 @@ async fn review_round(
         // A failed merge (branch protection, conflicts) shouldn't mark the
         // review round as failed -- the review itself already landed.
         match app.gh.merge(owner, name, pr).await {
-            Ok(()) => tracing::info!(%key, "auto-merged"),
-            Err(e) => tracing::warn!(%key, error = %e, "auto-merge failed"),
+            Ok(()) => info!(%key, "auto-merged"),
+            Err(e) => warn!(%key, error = %e, "auto-merge failed"),
         }
     }
 

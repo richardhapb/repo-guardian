@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::github::OpenComment;
 
+use tracing::{info, warn};
+
 /// Severity taxonomy borrowed from the mr-review flow.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -147,12 +149,13 @@ impl<R: CommandRunner + Clone> Guardian<R> {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let response: CliResponse = serde_json::from_str(extract_json(&stdout))
-            .map_err(|e| ClaudeError::StructuredOutputError {
+        let response: CliResponse = serde_json::from_str(extract_json(&stdout)).map_err(|e| {
+            ClaudeError::StructuredOutputError {
                 raw_result: stdout.clone().into_owned(),
                 source: e,
-            })?;
-        tracing::info!(
+            }
+        })?;
+        info!(
             duration_ms = response.duration_ms,
             turns = response.num_turns,
             cost_usd = response.total_cost_usd,
@@ -201,15 +204,13 @@ impl CliResponse {
                 }
             }),
             None => {
-                tracing::warn!(
+                warn!(
                     result = %&self.result[..self.result.len().min(2000)],
                     "no structured_output in the CLI response; parsing `result`"
                 );
-                serde_json::from_str(&self.result).map_err(|e| {
-                    ClaudeError::StructuredOutputError {
-                        raw_result: self.result,
-                        source: e,
-                    }
+                serde_json::from_str(&self.result).map_err(|e| ClaudeError::StructuredOutputError {
+                    raw_result: self.result,
+                    source: e,
                 })
             }
         }
@@ -298,9 +299,7 @@ fn build_prompt(commits: &[String], repo_location: &str, previous: &[OpenComment
          - nit: minor polish (optional, does not block)\n",
     );
     if !previous.is_empty() {
-        prompt.push_str(
-            "\nThese review comments from earlier rounds are still open:\n",
-        );
+        prompt.push_str("\nThese review comments from earlier rounds are still open:\n");
         for (i, posted) in previous.iter().enumerate() {
             let c = &posted.comment;
             let _ = writeln!(
@@ -487,10 +486,10 @@ mod tests {
 
         // every severity the schema's enum lists round-trips
         let schema: serde_json::Value = serde_json::from_str(&review_schema()).unwrap();
-        let severities = schema["properties"]["comments"]["items"]["properties"]["severity"]
-            ["enum"]
-            .as_array()
-            .expect("severity enum");
+        let severities =
+            schema["properties"]["comments"]["items"]["properties"]["severity"]["enum"]
+                .as_array()
+                .expect("severity enum");
         for s in severities {
             assert!(serde_json::from_value::<Severity>(s.clone()).is_ok(), "{s}");
         }

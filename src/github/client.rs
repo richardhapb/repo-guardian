@@ -28,6 +28,8 @@ impl ReviewVerdict {
     }
 }
 
+use tracing::{info, warn};
+
 /// Body posted to GitHub for an inline comment: marker and severity badge
 /// as a heading line, then the finding.
 pub fn comment_body(comment: &Comment) -> String {
@@ -161,7 +163,9 @@ impl GhClient {
             });
             let data: serde_json::Value = self.crab.graphql(&query).await?;
             check_graphql_errors(&data)?;
-            open.extend(parse_open_threads(&data));
+            let open_threads = parse_open_threads(&data);
+            info!(?open_threads);
+            open.extend(open_threads);
             match next_cursor(&data) {
                 Some(next) => cursor = Some(next),
                 None => return Ok(open),
@@ -187,7 +191,9 @@ impl GhClient {
                 .map_err(Error::from)
                 .and_then(|data| check_graphql_errors(&data).map(|()| data));
             if let Err(e) = outcome {
-                return Err(format!("resolved {resolved}/{} threads: {e}", thread_ids.len()).into());
+                return Err(
+                    format!("resolved {resolved}/{} threads: {e}", thread_ids.len()).into(),
+                );
             }
         }
         Ok(thread_ids.len())
@@ -204,9 +210,11 @@ impl GhClient {
 /// success.
 fn check_graphql_errors(data: &serde_json::Value) -> Result<(), Error> {
     match data.get("errors").and_then(|e| e.as_array()) {
-        Some(errors) if !errors.is_empty() => {
-            Err(format!("GraphQL errors: {}", serde_json::Value::Array(errors.clone())).into())
-        }
+        Some(errors) if !errors.is_empty() => Err(format!(
+            "GraphQL errors: {}",
+            serde_json::Value::Array(errors.clone())
+        )
+        .into()),
         _ => Ok(()),
     }
 }
@@ -239,7 +247,7 @@ fn parse_open_threads(data: &serde_json::Value) -> Vec<OpenComment> {
             let body = first["body"].as_str()?;
             let parsed = parse_comment_body(body);
             if parsed.is_none() && body.starts_with(MARKER) {
-                tracing::warn!(body, "unparseable Guardian comment; thread skipped");
+                warn!(body, "unparseable Guardian comment; thread skipped");
             }
             let (severity, text) = parsed?;
             // outdated comments lose `line`; fall back to the original anchor
@@ -297,8 +305,7 @@ mod tests {
     #[test]
     fn legacy_bodies_without_the_marker_parse_by_badge() {
         // comments posted before the marker existed start with the badge
-        let (severity, text) =
-            parse_comment_body("\u{1f7e2} **Nit**\n\nolder finding").unwrap();
+        let (severity, text) = parse_comment_body("\u{1f7e2} **Nit**\n\nolder finding").unwrap();
         assert_eq!(severity, Severity::Nit);
         assert_eq!(text, "older finding");
     }

@@ -28,13 +28,14 @@ pub struct App {
     pub username: Option<String>,
 }
 
+use tracing::{info, warn};
+
 #[launch]
 async fn rocket() -> _ {
     // RUST_LOG overrides, e.g. RUST_LOG=repo_guardian=debug
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -59,11 +60,11 @@ async fn rocket() -> _ {
     });
     let username = match octocrab.current().user().await {
         Ok(user) => {
-            tracing::info!(username = %user.login, "authenticated to GitHub");
+            info!(username = %user.login, "authenticated to GitHub");
             Some(user.login)
         }
         Err(e) => {
-            tracing::warn!(
+            warn!(
                 error = %e,
                 "could not resolve the authenticated user; own-PR detection disabled"
             );
