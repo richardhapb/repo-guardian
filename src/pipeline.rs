@@ -114,7 +114,8 @@ async fn review_round(
         info!(%key, resolved, "resolved fixed comment threads");
     }
 
-    let approved = decide_approval(&result);
+    let still_open = unresolved_previous(&result.unresolved_previous, &previous);
+    let approved = decide_approval(&result, &still_open);
     // GitHub rejects APPROVE/REQUEST_CHANGES reviews on one's own PR, so
     // when the author is the account Guardian runs as, the verdict is a
     // neutral comment and the body carries the outcome.
@@ -123,7 +124,13 @@ async fn review_round(
         .as_deref()
         .is_some_and(|user| author == Some(user));
     let verdict = choose_verdict(approved, own_pr);
-    let body = review_body(approved, own_pr, &result.comments, resolved);
+    let body = review_body(
+        approved,
+        own_pr,
+        &result.comments,
+        resolved,
+        still_open.len(),
+    );
     let submission = ReviewSubmission {
         commit_id: head_sha,
         verdict,
@@ -227,11 +234,36 @@ fn fixed_thread_ids(resolved_previous: &[usize], previous: &[OpenComment]) -> Ve
     ids
 }
 
+/// The previously-open comments the model reported as still unresolved.
+/// `unresolved_previous` comes straight from the model, so -- like
+/// [`fixed_thread_ids`] -- out-of-range indices are dropped and repeats
+/// deduplicated, keeping the reported count honest.
+fn unresolved_previous<'a>(
+    unresolved_previous: &[usize],
+    previous: &'a [OpenComment],
+) -> Vec<&'a OpenComment> {
+    let mut indices: Vec<usize> = unresolved_previous
+        .iter()
+        .copied()
+        .filter(|&i| i < previous.len())
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    indices.iter().map(|&i| &previous[i]).collect()
+}
+
 /// Guardian is asked to approve only when nothing above nit severity is
 /// found; enforce that here too so an inconsistent result can never approve
-/// (or auto-merge) a PR with an open bug or design finding.
-fn decide_approval(result: &ReviewResult) -> bool {
-    result.approved && result.comments.iter().all(|c| c.severity == Severity::Nit)
+/// (or auto-merge) a PR with an open bug or design finding. An earlier
+/// finding the push did not fix still counts: it is above nit and open, so
+/// it blocks just like a fresh one, even though the model was told not to
+/// re-report it as a new comment.
+fn decide_approval(result: &ReviewResult, still_open: &[&OpenComment]) -> bool {
+    result.approved
+        && result.comments.iter().all(|c| c.severity == Severity::Nit)
+        && still_open
+            .iter()
+            .all(|p| p.comment.severity == Severity::Nit)
 }
 
 fn choose_verdict(approved: bool, own_pr: bool) -> ReviewVerdict {
@@ -244,7 +276,13 @@ fn choose_verdict(approved: bool, own_pr: bool) -> ReviewVerdict {
     }
 }
 
-fn review_body(approved: bool, own_pr: bool, comments: &[Comment], resolved: usize) -> String {
+fn review_body(
+    approved: bool,
+    own_pr: bool,
+    comments: &[Comment],
+    resolved: usize,
+    unresolved: usize,
+) -> String {
     use std::fmt::Write as _;
 
     let verdict = match (approved, own_pr) {
@@ -255,7 +293,16 @@ fn review_body(approved: bool, own_pr: bool, comments: &[Comment], resolved: usi
     let mut body = format!("## \u{1f6e1}\u{fe0f} Guardian review\n\n**Verdict: {verdict}**\n");
 
     if comments.is_empty() {
-        body.push_str("\n\u{1f389} No findings.\n");
+        // If there are no unresolved findigns we can celebrate.
+        if unresolved == 0 {
+            body.push_str("\n\u{1f389} No findings.\n");
+        } else {
+            // Otherwise, be aware
+            let _ = write!(
+                body,
+                "\n\u{1f4ac} No new findings. But there are {unresolved} earlier comment(s) unresolved yet.\n",
+            );
+        }
     } else {
         body.push_str("\n| Severity | Count |\n| --- | --- |\n");
         for severity in [Severity::Bug, Severity::Design, Severity::Nit] {
@@ -290,14 +337,18 @@ mod tests {
         }
     }
 
+    fn open(thread_id: &str, severity: Severity) -> OpenComment {
+        OpenComment {
+            thread_id: thread_id.into(),
+            comment: comment(severity),
+        }
+    }
+
     #[test]
     fn fixed_thread_ids_drop_out_of_range_and_repeated_indices() {
         let previous: Vec<OpenComment> = ["T_a", "T_b"]
             .into_iter()
-            .map(|id| OpenComment {
-                thread_id: id.into(),
-                comment: comment(Severity::Nit),
-            })
+            .map(|id| open(id, Severity::Nit))
             .collect();
 
         // the model repeated index 1 and invented index 9
@@ -311,48 +362,105 @@ mod tests {
             approved: true,
             comments: vec![comment(Severity::Bug), comment(Severity::Nit)],
             resolved_previous: vec![],
+            unresolved_previous: vec![],
         };
-        assert!(!decide_approval(&result));
+        assert!(!decide_approval(&result, &[]));
 
         // design findings ask for a fix too; only nits may pass
         let result = ReviewResult {
             approved: true,
             comments: vec![comment(Severity::Design), comment(Severity::Nit)],
             resolved_previous: vec![],
+            unresolved_previous: vec![],
         };
-        assert!(!decide_approval(&result));
+        assert!(!decide_approval(&result, &[]));
 
         let result = ReviewResult {
             approved: true,
             comments: vec![comment(Severity::Nit)],
             resolved_previous: vec![],
+            unresolved_previous: vec![],
         };
-        assert!(decide_approval(&result));
+        assert!(decide_approval(&result, &[]));
 
         let result = ReviewResult {
             approved: false,
             comments: vec![],
             resolved_previous: vec![],
+            unresolved_previous: vec![],
         };
-        assert!(!decide_approval(&result));
+        assert!(!decide_approval(&result, &[]));
+    }
+
+    #[test]
+    fn approval_is_vetoed_by_previous_findings_left_unresolved() {
+        // the push fixed nothing new, and the model reported no fresh
+        // findings because it was told not to re-report still-open ones
+        let result = ReviewResult {
+            approved: true,
+            comments: vec![],
+            resolved_previous: vec![],
+            unresolved_previous: vec![0],
+        };
+
+        let previous = vec![open("T_a", Severity::Design)];
+        let still_open = unresolved_previous(&result.unresolved_previous, &previous);
+        assert_eq!(still_open.len(), 1);
+        assert!(!decide_approval(&result, &still_open));
+
+        // an unresolved nit is optional polish, so it still may pass
+        let previous = vec![open("T_a", Severity::Nit)];
+        let still_open = unresolved_previous(&result.unresolved_previous, &previous);
+        assert!(decide_approval(&result, &still_open));
+
+        // a previous bug the model listed as both fixed and still open
+        // blocks: resolving its thread doesn't make the finding go away
+        let result = ReviewResult {
+            approved: true,
+            comments: vec![],
+            resolved_previous: vec![0],
+            unresolved_previous: vec![0],
+        };
+        let previous = vec![open("T_a", Severity::Bug)];
+        let still_open = unresolved_previous(&result.unresolved_previous, &previous);
+        assert!(!decide_approval(&result, &still_open));
+    }
+
+    #[test]
+    fn unresolved_previous_drops_out_of_range_and_repeated_indices() {
+        let previous = vec![open("T_a", Severity::Bug), open("T_b", Severity::Nit)];
+
+        // the model repeated index 1 and invented index 9
+        let still_open = unresolved_previous(&[1, 9, 1, 0], &previous);
+        let ids: Vec<&str> = still_open.iter().map(|p| p.thread_id.as_str()).collect();
+        assert_eq!(ids, vec!["T_a", "T_b"]);
+
+        assert!(unresolved_previous(&[0], &[]).is_empty());
     }
 
     #[test]
     fn review_body_summarizes_verdict_and_severities() {
-        let body = review_body(true, false, &[], 0);
+        let body = review_body(true, false, &[], 0, 0);
         assert!(body.contains("## \u{1f6e1}\u{fe0f} Guardian review"));
         assert!(body.contains("**Verdict: \u{2705} Approved**"));
         assert!(body.contains("\u{1f389} No findings."));
         assert!(!body.contains("Resolved"));
 
-        let body = review_body(true, true, &[], 2);
+        let body = review_body(true, true, &[], 2, 0);
         assert!(body.contains("\u{2705} All good to merge"));
         assert!(body.contains("\u{267b}\u{fe0f} Resolved 2 earlier comment(s)"));
+
+        let body = review_body(true, true, &[], 0, 2);
+        assert!(body.contains("\u{2705} All good to merge"));
+        assert!(body.contains(
+            "\u{1f4ac} No new findings. But there are 2 earlier comment(s) unresolved yet.\n"
+        ));
 
         let body = review_body(
             false,
             false,
             &[comment(Severity::Bug), comment(Severity::Design)],
+            0,
             0,
         );
         assert!(body.contains("\u{26a0}\u{fe0f} Changes requested"));
@@ -383,7 +491,7 @@ mod tests {
 
     #[test]
     fn fallback_body_folds_findings_into_the_review_body() {
-        let body = review_body(false, false, &[comment(Severity::Bug)], 0);
+        let body = review_body(false, false, &[comment(Severity::Bug)], 0, 0);
         let out = fallback_body(&body, &[comment(Severity::Bug)]);
 
         assert!(out.contains("Changes requested"));
